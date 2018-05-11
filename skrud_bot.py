@@ -38,7 +38,7 @@ def _get_current_value_of_stock(symbol: str):
     last_data_point = data[last_data_point_key]
     last_refreshed = metadata.get('3. Last Refreshed', None)
 
-    logging.info("Stock symbol:%s last_data_point:%s last_refreshed:%s",
+    logger.info("Stock symbol:%s last_data_point:%s last_refreshed:%s",
                  symbol, last_data_point, last_refreshed)
     return last_data_point, last_data_point_key, last_refreshed
 
@@ -52,10 +52,13 @@ def lambda_handler(event, context):
     if stock_quote_match:
         stock_symbol = stock_quote_match.group(1)
 
-        logging.info("Found stock symbol %s", stock_symbol)
+        logger.info("Found stock symbol %s", stock_symbol)
 
-        last_data_point, last_data_point_key, last_refreshed =\
-            _get_current_value_of_stock(stock_symbol)
+        try:
+            last_data_point, last_data_point_key, last_refreshed =\
+                _get_current_value_of_stock(stock_symbol)
+        except ValueError as e:
+            logger.exception("Error getting stock info for %s", stock_symbol)
 
         message = 'stock_data for {}: {} (Last Refreshed: {})'.format(
             stock_symbol, last_data_point, last_refreshed
