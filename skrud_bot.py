@@ -91,11 +91,12 @@ class StockData(object):
         dates = sorted(self.data.keys())
         if self.interval_length:
             dates = dates[-self.interval_length:]
+        start, end = dates[0], dates[-1]
         return {
             'xaxis': dates,
             'yaxis': [float(self.data[d]['4. close']) for d in dates],
-            'title': "{} (Last Refreshed {})".format(self.symbol,
-                                                     self.last_refreshed),
+            'title': "{} ({} - {})".format(self.symbol,
+                                           start, end),
             'xlabel': "Time",
             'ylabel': "$"
         }
