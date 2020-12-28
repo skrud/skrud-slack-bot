@@ -10,9 +10,11 @@ import json
 import logging
 import os
 import re
+import abc
 
 from alpha_vantage.timeseries import TimeSeries
-import slackclient
+from alpha_vantage.cryptocurrencies import CryptoCurrencies
+from slack_sdk import WebClient
 
 
 BOT_USER_API_KEY = os.environ.get('BOT_USER_API_KEY', None)
@@ -24,27 +26,87 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
-class StockData(object):
+class Interval(metaclass=abc.ABCMeta):
     INTERVALS = {
-        'intraday': 'get_intraday',
-        'daily': 'get_daily',
-        'weekly': 'get_weekly',
-        'monthly': 'get_monthly'
+        'intraday',
+        'daily',
+        'weekly',
+        'monthly'
     }
 
-    def __init__(self, symbol: str, interval=None, interval_length=None):
-        self.symbol = symbol
-
+    def __init__(self, interval=None, interval_length=None, key_name='4. close'):
         if interval and interval not in StockData.INTERVALS:
             raise ValueError("'%s' is not a valid interval.", interval)
 
         self.interval = interval or 'intraday'
         self.interval_length = interval_length
-        self.ts = TimeSeries(key=ALPHA_VANTAGE_API_KEY)
-        self._data = self._metadata = None
+        self.key_name = key_name
+        self._data = self._metadata = self._dates = None
 
-    def __load(self):
-        f = getattr(self.ts, StockData.INTERVALS[self.interval])
+    @staticmethod
+    def is_valid_interval(interval):
+        return interval and interval in INTERVALS
+
+    @property
+    def data(self):
+        if not self._data:
+            self._load()
+        return self._data
+
+    @property
+    def metadata(self):
+        if not self._metadata:
+            self._load()
+        return self._metadata
+
+    @property
+    def current_value(self):
+        last_data_point_key = max(self.data.keys())
+        last_data_point = self.data[last_data_point_key]
+
+        return last_data_point[self.key_name]
+
+    @property
+    def mean_value(self):
+        close_values = [float(self.data[d][self.key_name]) for d in self.dates]
+        if close_values:
+            mean = sum(close_values) / len(close_values)
+            return '{0:.2f}'.format(mean)
+        return '0.0'
+
+    @property
+    def last_refreshed(self):
+        last_refreshed = self.metadata.get('3. Last Refreshed', None)
+
+        return last_refreshed
+
+    @property
+    def dates(self):
+        if not self._dates:
+            dates = sorted(self.data.keys())
+            if self.interval_length:
+                dates = dates[-self.interval_length:]
+            self._dates = dates
+        return self._dates
+
+    @property
+    def date_range(self):
+        return self.dates[0], self.dates[-1]
+
+    @abc.abstractmethod
+    def _load(self):
+        pass
+
+
+class StockData(Interval):
+    def __init__(self, symbol: str, interval=None, interval_length=None):
+        self.symbol = symbol
+        self.ts = TimeSeries(key=ALPHA_VANTAGE_API_KEY)
+        self._data = self._metadata = self._dates = None
+        super(StockData, self).__init__(interval, interval_length, '4. close')
+
+    def _load(self):
+        f = getattr(self.ts, 'get_{}'.format(self.interval))
         self._data, self._metadata = f(self.symbol)
 
     @staticmethod
@@ -62,39 +124,11 @@ class StockData(object):
 
         return 'intraday'
 
-    @property
-    def data(self):
-        if not self._data:
-            self.__load()
-        return self._data
-
-    @property
-    def metadata(self):
-        if not self._metadata:
-            self.__load()
-        return self._metadata
-
-    @property
-    def current_value(self):
-        last_data_point_key = max(self.data.keys())
-        last_data_point = self.data[last_data_point_key]
-
-        return last_data_point['4. close']
-
-    @property
-    def last_refreshed(self):
-        last_refreshed = self.metadata.get('3. Last Refreshed', None)
-
-        return last_refreshed
-
     def graph(self):
-        dates = sorted(self.data.keys())
-        if self.interval_length:
-            dates = dates[-self.interval_length:]
-        start, end = dates[0], dates[-1]
+        start, end = self.date_range
         return {
-            'xaxis': dates,
-            'yaxis': [float(self.data[d]['4. close']) for d in dates],
+            'xaxis': self.dates,
+            'yaxis': [float(self.data[d][self.key_name]) for d in self.dates],
             'title': "{} ({} - {})".format(self.symbol,
                                            start, end),
             'xlabel': "Time",
@@ -102,10 +136,33 @@ class StockData(object):
         }
 
 
+class BtcData(Interval):
+    def __init__(self, symbol='BTC', market='USD'):
+        self.cc = CryptoCurrencies(
+            key=ALPHA_VANTAGE_API_KEY)
+        self.symbol = symbol
+        self.market = market
+        super(BtcData, self).__init__(None, None,
+                                      key_name='4a. close ({})'.format(self.market))
+
+    def _load(self):
+        self._data, self._metadata = self.cc.get_digital_currency_daily(
+            symbol=self.symbol, market=self.market)
+
+    def graph(self):
+        start, end = self.date_range
+        return {
+            'xaxis': self.dates,
+            'yaxis': [float(self.data[d][self.key_name]) for d in self.dates],
+            'title': "{} ({} - {})".format(self.symbol, start, end),
+            'xlabel': "Time",
+            'ylabel': "{}".format(self.market)
+        }
+
+
 def _send_slack_message(channel, message_text):
-    sc = slackclient.SlackClient(BOT_USER_API_KEY)
-    sc.api_call(
-        'chat.postMessage',
+    sc = WebClient(token=BOT_USER_API_KEY)
+    sc.chat_postMessage(
         channel=channel,
         text=message_text
     )
@@ -121,6 +178,11 @@ def _get_stock_symbol(text: str):
         return stock_symbol
 
     return None
+
+
+def _is_bitcoin(text: str):
+    btc_match = re.search(r'(bitcoin|\u20bf|btc)', text)
+    return btc_match
 
 
 def _find_interval(message_text: str):
@@ -140,18 +202,24 @@ def _find_interval(message_text: str):
 
 def lambda_handler(event, context):
     slack_event = json.loads(event['body'])['event']
-    sc = slackclient.SlackClient(BOT_USER_API_KEY)
-
     message_text = slack_event['text']
-    stock_symbol = _get_stock_symbol(message_text)
 
-    if stock_symbol:
-        interval_length, interval = _find_interval(message_text)
-        sd = StockData(stock_symbol, interval=interval,
-                       interval_length=interval_length)
+    stock_symbol = None
+    sd = None
+    interval_length = interval = None
+    if _is_bitcoin(message_text):
+        stock_symbol = 'BTC'
+        sd = BtcData()
+    else:
+        stock_symbol = _get_stock_symbol(message_text)
+        if stock_symbol:
+            interval_length, interval = _find_interval(message_text)
+            sd = StockData(stock_symbol, interval=interval,
+                           interval_length=interval_length)
+
+    if sd:
         try:
             graph = sd.graph()
-
             current_value = sd.current_value
         except ValueError as e:
             logger.exception("Error getting stock info for %s", stock_symbol)
@@ -159,11 +227,12 @@ def lambda_handler(event, context):
             _send_slack_message(slack_event['channel'],
                                 "Error getting stock info for {}: {}".format(
                                     stock_symbol, str(e)
-                                ))
+            ))
             return
         else:
-            message = 'Current Value for {}: {} (Last Refreshed: {})'.format(
-                stock_symbol, current_value, sd.last_refreshed
+            message = 'Current Value for {}: {} Mean Value: {} (Range: {} - {}) (Last Refreshed: {})'.format(
+                stock_symbol, current_value, sd.mean_value, sd.date_range[
+                    0], sd.date_range[1], sd.last_refreshed
             )
 
             if not re.search(r'nograph', message_text):
@@ -183,7 +252,8 @@ def lambda_handler(event, context):
                 else:
                     graph_payload['interval'] = 'intraday'
 
-                payload = io.BytesIO(json.dumps(graph_payload, ensure_ascii=False).encode('utf8'))
+                payload = io.BytesIO(json.dumps(
+                    graph_payload, ensure_ascii=False).encode('utf8'))
                 res = boto3.client('lambda').invoke(
                     FunctionName=GRAPH_FUNCTION_ARN,
                     Payload=payload,
@@ -191,15 +261,12 @@ def lambda_handler(event, context):
                 )
                 logger.info("Invoked lambda: %s", str(res))
             else:
-                logger.info("Sending Slack message to channel %s", slack_event['channel'])
+                logger.info("Sending Slack message to channel %s",
+                            slack_event['channel'])
                 _send_slack_message(slack_event['channel'], message)
             return
 
-    sc.api_call(
-        'chat.postMessage',
-        channel=slack_event['channel'],
-        text=json.dumps(slack_event)
-    )
+    _send_slack_message(slack_event['channel'], json.dumps(slack_event))
 
 
 if __name__ == '__main__':
@@ -210,12 +277,21 @@ if __name__ == '__main__':
                                                       'ERROR', 'TRACE'),
                         default='INFO')
     parser.add_argument('-s', '--stock-symbol', type=str)
+    parser.add_argument('-b', '--bitcoin', action='store_true', default=False)
     parser.add_argument('-i', '--interval', type=str, default='')
     parser.add_argument('-o', '--output', type=str)
 
     options = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, options.log_level))
+
+    if options.bitcoin:
+        bt = BtcData()
+        g = bt.graph()
+
+        logging.debug(bt.data)
+        logging.debug(bt.metadata)
+        logging.debug(g)
 
     if options.stock_symbol:
         interval_length, interval = _find_interval(options.interval)
@@ -224,7 +300,11 @@ if __name__ == '__main__':
         logging.info("%s datapoints", len(sd.data))
         logging.debug(sd.data)
         logging.debug(sd.metadata)
-        logging.info("Current Value:%s Last Refreshed:%s", sd.current_value,
+        logging.info("Current Value:%s Mean Value:%s (%s - %s) Last Refreshed:%s",
+                     sd.current_value,
+                     sd.mean_value,
+                     sd.date_range[0],
+                     sd.date_range[1],
                      sd.last_refreshed)
 
         if options.output:
