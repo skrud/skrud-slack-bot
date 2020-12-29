@@ -141,13 +141,13 @@ class StockData(Interval):
 
 
 class BtcData(Interval):
-    def __init__(self, interval='daily', interval_length=7, symbol='BTC', market='USD'):
+    def __init__(self, interval=None, interval_length=None, symbol='BTC', market='USD'):
         self.cc = CryptoCurrencies(
             key=ALPHA_VANTAGE_API_KEY)
         self.fe = ForeignExchange(key=ALPHA_VANTAGE_API_KEY)
         self.symbol = symbol
         self.market = market
-        super(BtcData, self).__init__(interval, interval_length,
+        super(BtcData, self).__init__(interval or 'daily', interval_length or 7,
                                       key_name='4a. close ({})'.format(self.market))
 
     def _load(self):
@@ -227,7 +227,7 @@ def lambda_handler(event, context):
 
     sd = None
     stock_symbol = _get_stock_symbol(message_text)
-    interval_length = interval = _find_interval(message_text)
+    interval_length, interval = _find_interval(message_text)
     if stock_symbol:
         sd = StockData(stock_symbol, interval=interval,
                        interval_length=interval_length)
