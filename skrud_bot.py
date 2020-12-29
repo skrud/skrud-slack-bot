@@ -14,6 +14,7 @@ import abc
 
 from alpha_vantage.timeseries import TimeSeries
 from alpha_vantage.cryptocurrencies import CryptoCurrencies
+from alpha_vantage.foreignexchange import ForeignExchange
 from slack_sdk import WebClient
 
 
@@ -64,7 +65,7 @@ class Interval(metaclass=abc.ABCMeta):
         last_data_point_key = max(self.data.keys())
         last_data_point = self.data[last_data_point_key]
 
-        return last_data_point[self.key_name]
+        return '{0:.2f}'.format(float(last_data_point[self.key_name]))
 
     @property
     def mean_value(self):
@@ -74,11 +75,9 @@ class Interval(metaclass=abc.ABCMeta):
             return '{0:.2f}'.format(mean)
         return '0.0'
 
-    @property
+    @abc.abstractproperty
     def last_refreshed(self):
-        last_refreshed = self.metadata.get('3. Last Refreshed', None)
-
-        return last_refreshed
+        pass
 
     @property
     def dates(self):
@@ -124,6 +123,11 @@ class StockData(Interval):
 
         return 'intraday'
 
+    @property
+    def last_refreshed(self):
+        last_refreshed = self.metadata.get('3. Last Refreshed', None)
+        return last_refreshed
+
     def graph(self):
         start, end = self.date_range
         return {
@@ -137,17 +141,34 @@ class StockData(Interval):
 
 
 class BtcData(Interval):
-    def __init__(self, symbol='BTC', market='USD'):
+    def __init__(self, interval=None, interval_length=None, symbol='BTC', market='USD'):
         self.cc = CryptoCurrencies(
             key=ALPHA_VANTAGE_API_KEY)
+        self.fe = ForeignExchange(key=ALPHA_VANTAGE_API_KEY)
         self.symbol = symbol
         self.market = market
-        super(BtcData, self).__init__(None, None,
+        super(BtcData, self).__init__(interval or 'daily', interval_length or 7,
                                       key_name='4a. close ({})'.format(self.market))
 
     def _load(self):
-        self._data, self._metadata = self.cc.get_digital_currency_daily(
+        f = getattr(self.cc, 'get_digital_currency_{}'.format(self.interval))
+        self._data, self._metadata = f(
             symbol=self.symbol, market=self.market)
+
+        try:
+            current, _ = self.fe.get_currency_exchange_rate(
+                from_currency=self.symbol, to_currency=self.market)
+            date_str, _ = current['6. Last Refreshed'].split(' ')
+            self._data[date_str][self.key_name] = current['5. Exchange Rate']
+            self._metadata['6. Last Refreshed'] = current['6. Last Refreshed']
+        except ValueError as e:
+            logger.info(
+                'Unable to get current exchange - rate limited', exc_info=e)
+
+    @property
+    def last_refreshed(self):
+        last_refreshed = self.metadata.get('6. Last Refreshed', None)
+        return last_refreshed
 
     def graph(self):
         start, end = self.date_range
@@ -204,18 +225,19 @@ def lambda_handler(event, context):
     slack_event = json.loads(event['body'])['event']
     message_text = slack_event['text']
 
-    stock_symbol = None
     sd = None
-    interval_length = interval = None
-    if _is_bitcoin(message_text):
+    stock_symbol = _get_stock_symbol(message_text)
+    interval_length, interval = _find_interval(message_text)
+    if stock_symbol:
+        sd = StockData(stock_symbol, interval=interval,
+                       interval_length=interval_length)
+    elif _is_bitcoin(message_text):
         stock_symbol = 'BTC'
-        sd = BtcData()
+        sd = BtcData(interval=interval, interval_length=interval_length)
     else:
-        stock_symbol = _get_stock_symbol(message_text)
-        if stock_symbol:
-            interval_length, interval = _find_interval(message_text)
-            sd = StockData(stock_symbol, interval=interval,
-                           interval_length=interval_length)
+        _send_slack_message(
+            slack_event['channel'], "Could not find stock symbol or bitcoin in the message text.")
+        return
 
     if sd:
         try:
@@ -285,28 +307,24 @@ if __name__ == '__main__':
 
     logging.basicConfig(level=getattr(logging, options.log_level))
 
+    sd = None
+    interval_length, interval = _find_interval(options.interval)
     if options.bitcoin:
-        bt = BtcData()
-        g = bt.graph()
-
-        logging.debug(bt.data)
-        logging.debug(bt.metadata)
-        logging.debug(g)
+        sd = BtcData()
 
     if options.stock_symbol:
-        interval_length, interval = _find_interval(options.interval)
         sd = StockData(options.stock_symbol, interval, interval_length)
 
-        logging.info("%s datapoints", len(sd.data))
-        logging.debug(sd.data)
-        logging.debug(sd.metadata)
-        logging.info("Current Value:%s Mean Value:%s (%s - %s) Last Refreshed:%s",
-                     sd.current_value,
-                     sd.mean_value,
-                     sd.date_range[0],
-                     sd.date_range[1],
-                     sd.last_refreshed)
+    logging.info("%s datapoints", len(sd.data))
+    logging.debug(sd.data)
+    logging.debug(sd.metadata)
+    logging.info("Current Value:%s Mean Value:%s (%s - %s) Last Refreshed:%s",
+                 sd.current_value,
+                 sd.mean_value,
+                 sd.date_range[0],
+                 sd.date_range[1],
+                 sd.last_refreshed)
 
-        if options.output:
-            with open(options.output, 'w') as output_file:
-                json.dump(sd.graph(), output_file, indent=2)
+    if options.output:
+        with open(options.output, 'w') as output_file:
+            json.dump(sd.graph(), output_file, indent=2)
